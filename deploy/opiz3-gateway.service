@@ -1,0 +1,13 @@
+[Unit]
+Description=Orange Pi Zero 3 Linux Edge Gateway
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/opiz3-gateway --config /etc/orangepi/opiz3-gateway.conf --daemon
+Restart=on-failure
+RestartSec=5
+LimitNOFILE=4096
+
+[Install]
+WantedBy=multi-user.target

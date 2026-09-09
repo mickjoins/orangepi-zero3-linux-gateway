@@ -1,0 +1,11 @@
+# build output
+/build/
+*.o
+*.a
+*.so
+*.swp
+
+# editor / os
+.vscode/
+.idea/
+*~
