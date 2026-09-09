@@ -1,5 +1,6 @@
 #include "http_server.h"
 
+#include <arpa/inet.h>
 #include <errno.h>
 #include <netinet/in.h>
 #include <pthread.h>
@@ -103,6 +104,22 @@ static const char *http_code_text(int code)
     }
 }
 
+static int http_write_all(int fd, const char *buf, size_t len)
+{
+    size_t off = 0;
+
+    while (off < len) {
+        ssize_t n = send(fd, buf + off, len - off, MSG_NOSIGNAL);
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            return -1;
+        }
+        if (n == 0) return -1;
+        off += (size_t)n;
+    }
+    return 0;
+}
+
 static void http_send(int fd, int code, const char *content_type, const char *body)
 {
     char header[512];
@@ -118,12 +135,9 @@ static void http_send(int fd, int code, const char *content_type, const char *bo
              "\r\n",
              code, http_code_text(code), APP_VERSION, content_type, body_len);
 
-    ssize_t w;
-    w = write(fd, header, strlen(header));
-    (void)w;
+    if (http_write_all(fd, header, strlen(header)) != 0) return;
     if (body && body_len > 0) {
-        w = write(fd, body, body_len);
-        (void)w;
+        (void)http_write_all(fd, body, body_len);
     }
 }
 
@@ -151,6 +165,13 @@ static int http_get_query_param(const char *path, const char *name, char *out, s
         q = p + strlen(name);
     }
     return 0;
+}
+
+static int http_path_matches(const char *path, const char *route)
+{
+    size_t n = strlen(route);
+
+    return strncmp(path, route, n) == 0 && (path[n] == '\0' || path[n] == '?');
 }
 
 /* ------------------------------------------------------------------ */
@@ -245,7 +266,6 @@ static void handle_client(int fd)
     ssize_t n;
     char method[8] = "";
     char path[512] = "";
-    char *line_end;
 
     /* Read request head (up to blank line). */
     n = read(fd, buf, sizeof(buf) - 1);
@@ -259,22 +279,19 @@ static void handle_client(int fd)
 
     LOG_INFO("HTTP %s %s", method, path);
 
-    line_end = strstr(buf, "\r\n\r\n");
-    (void)line_end; /* we do not need headers for this tiny API */
-
     if (strcmp(method, "GET") == 0 && strcmp(path, "/") == 0) {
         http_send(fd, 200, "text/html", INDEX_HTML);
         return;
     }
 
-    if (strcmp(path, "/api/status") == 0) {
+    if (http_path_matches(path, "/api/status")) {
         char json[2048];
         build_status_json(json, sizeof(json));
         http_send(fd, 200, "application/json", json);
         return;
     }
 
-    if (strncmp(path, "/api/sensor", 11) == 0) {
+    if (http_path_matches(path, "/api/sensor")) {
         sensor_sample_t s;
         char json[256];
         shared_get_sensor(&s);
@@ -289,7 +306,7 @@ static void handle_client(int fd)
         return;
     }
 
-    if (strncmp(path, "/api/serial", 11) == 0) {
+    if (http_path_matches(path, "/api/serial")) {
         char line[512];
         char json[2000];
         char esc[1600];
@@ -300,7 +317,7 @@ static void handle_client(int fd)
         return;
     }
 
-    if (strncmp(path, "/api/gpio", 9) == 0) {
+    if (http_path_matches(path, "/api/gpio")) {
         char state[32] = "";
         int  led = -1;
 
@@ -342,38 +359,14 @@ static void handle_client(int fd)
 
 static void *http_server_thread(void *arg)
 {
-    int port = *(int *)arg;
-    int fd;
-    int reuse = 1;
-    struct sockaddr_in addr;
+    int fd = g_listen_fd;
 
-    fd = socket(AF_INET, SOCK_STREAM, 0);
+    (void)arg;
+
     if (fd < 0) {
-        LOG_ERROR("socket() failed: %s", strerror(errno));
+        LOG_ERROR("HTTP server thread started without a listen socket");
         return NULL;
     }
-
-    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
-
-    memset(&addr, 0, sizeof(addr));
-    addr.sin_family = AF_INET;
-    addr.sin_addr.s_addr = htonl(INADDR_ANY);
-    addr.sin_port = htons((unsigned short)port);
-
-    if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-        LOG_ERROR("bind(:%d) failed: %s", port, strerror(errno));
-        close(fd);
-        return NULL;
-    }
-
-    if (listen(fd, 8) < 0) {
-        LOG_ERROR("listen() failed: %s", strerror(errno));
-        close(fd);
-        return NULL;
-    }
-
-    g_listen_fd = fd;
-    LOG_INFO("HTTP server listening on 0.0.0.0:%d", port);
 
     while (shared_is_running()) {
         int client = accept(fd, NULL, NULL);
@@ -389,32 +382,82 @@ static void *http_server_thread(void *arg)
     }
 
     close(fd);
-    g_listen_fd = -1;
+    if (g_listen_fd == fd) g_listen_fd = -1;
     LOG_INFO("HTTP server thread exited");
     return NULL;
 }
 
 int http_server_start(int port, const char *bind_ip)
 {
-    static int port_arg;
-    (void)bind_ip; /* bind 0.0.0.0; config kept for future use */
-    port_arg = port;
+    int fd;
+    int reuse = 1;
+    struct sockaddr_in addr;
 
     if (g_thread_started) return 0;
 
-    if (pthread_create(&g_thread, NULL, http_server_thread, &port_arg) != 0) {
+    if (port <= 0 || port > 65535) {
+        LOG_ERROR("invalid HTTP port: %d", port);
+        return -1;
+    }
+
+    fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) {
+        LOG_ERROR("socket() failed: %s", strerror(errno));
+        return -1;
+    }
+
+    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
+
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons((unsigned short)port);
+
+    if (bind_ip && bind_ip[0]) {
+        if (inet_pton(AF_INET, bind_ip, &addr.sin_addr) != 1) {
+            LOG_ERROR("invalid HTTP bind IP: %s", bind_ip);
+            close(fd);
+            return -1;
+        }
+    } else {
+        addr.sin_addr.s_addr = htonl(INADDR_ANY);
+    }
+
+    if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+        LOG_ERROR("bind(%s:%d) failed: %s",
+                  bind_ip && bind_ip[0] ? bind_ip : "0.0.0.0",
+                  port, strerror(errno));
+        close(fd);
+        return -1;
+    }
+
+    if (listen(fd, 8) < 0) {
+        LOG_ERROR("listen() failed: %s", strerror(errno));
+        close(fd);
+        return -1;
+    }
+
+    g_listen_fd = fd;
+
+    if (pthread_create(&g_thread, NULL, http_server_thread, NULL) != 0) {
         LOG_ERROR("cannot start http server thread");
+        close(fd);
+        g_listen_fd = -1;
         return -1;
     }
     g_thread_started = 1;
+    LOG_INFO("HTTP server listening on %s:%d",
+             bind_ip && bind_ip[0] ? bind_ip : "0.0.0.0", port);
     return 0;
 }
 
 void http_server_stop(void)
 {
-    if (g_listen_fd >= 0) {
-        shutdown(g_listen_fd, SHUT_RDWR);
+    int fd = g_listen_fd;
+
+    if (fd >= 0) {
+        (void)shutdown(fd, SHUT_RDWR);
     }
+
     if (g_thread_started) {
         pthread_join(g_thread, NULL);
         g_thread_started = 0;

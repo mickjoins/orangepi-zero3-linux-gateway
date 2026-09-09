@@ -49,6 +49,14 @@ static char *trim(char *s)
     return s;
 }
 
+static char *strip_inline_comment(char *s)
+{
+    char *p = strpbrk(s, "#;");
+
+    if (p) *p = '\0';
+    return s;
+}
+
 static int parse_key_value(app_config_t *cfg, const char *key, const char *value)
 {
     if (strcmp(key, "http_port") == 0) {
@@ -104,7 +112,6 @@ int config_load(app_config_t *cfg, const char *path)
         char *p;
         char *key;
         char *value;
-        char *section_tmp;
 
         lineno++;
         p = trim(line);
@@ -124,9 +131,9 @@ int config_load(app_config_t *cfg, const char *path)
 
         *value = '\0';
         value = trim(value + 1);
+        value = strip_inline_comment(value);
+        value = trim(value);
 
-        section_tmp = strchr(key, ']');
-        (void)section_tmp;
         key = trim(key);
 
         if (parse_key_value(cfg, key, value) != 0) {

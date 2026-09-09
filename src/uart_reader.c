@@ -2,6 +2,7 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <poll.h>
 #include <stdio.h>
 #include <string.h>
 #include <unistd.h>
@@ -62,7 +63,8 @@ int uart_open(uart_handle_t *u)
     tio.c_cflag |= (CLOCAL | CREAD);
     tio.c_cflag &= ~CRTSCTS;
 
-    /* VMIN=1, VTIME=5 (0.5s) so read_line has a soft timeout. */
+    /* VMIN=1, VTIME=5 gives the tty a soft inter-byte timeout.
+     * uart_read_line() itself uses poll() so shutdown stays responsive. */
     tio.c_cc[VMIN] = 1;
     tio.c_cc[VTIME] = 5;
 
@@ -71,6 +73,20 @@ int uart_open(uart_handle_t *u)
         close(u->fd);
         u->fd = -1;
         return -1;
+    }
+
+    /* The port is opened non-blocking only to avoid a blocking open()
+     * before CLOCAL is set. Now switch it back to blocking; read() calls
+     * are still guarded by poll() in uart_read_line(). */
+    {
+        int flags = fcntl(u->fd, F_GETFL, 0);
+        if (flags < 0 || fcntl(u->fd, F_SETFL, flags & ~O_NONBLOCK) < 0) {
+            LOG_WARN("cannot set serial port %s to blocking mode: %s",
+                     u->device, strerror(errno));
+            close(u->fd);
+            u->fd = -1;
+            return -1;
+        }
     }
 
     /* clear any stale data */
@@ -87,30 +103,59 @@ int uart_read_line(uart_handle_t *u, char *buf, int buf_size)
     if (!u || !buf || buf_size < 2 || u->fd < 0) return -1;
 
     while (pos < buf_size - 1) {
-        ssize_t n = read(u->fd, &ch, 1);
-        if (n == 1) {
-            if (ch == '\n') {
-                buf[pos] = '\0';
-                /* strip optional trailing '\r' */
-                if (pos > 0 && buf[pos - 1] == '\r') buf[pos - 1] = '\0';
-                return pos > 0 ? (int)strlen(buf) : 0;
-            }
-            buf[pos++] = ch;
-        } else if (n == 0) {
-            break; /* timeout or EOF */
-        } else {
-            if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                usleep(10 * 1000);
-                continue;
-            }
+        struct pollfd pfd;
+        int ready;
+
+        memset(&pfd, 0, sizeof(pfd));
+        pfd.fd = u->fd;
+        pfd.events = POLLIN;
+
+        /* 200 ms timeout: makes shutdown and partial-line handling responsive
+         * without relying on VMIN/VTIME semantics of the underlying tty. */
+        ready = poll(&pfd, 1, 200);
+        if (ready < 0) {
             if (errno == EINTR) continue;
             return -1; /* real error */
+        }
+        if (ready == 0) {
+            if (pos > 0) {
+                buf[pos] = '\0';
+                return pos; /* partial line on timeout */
+            }
+            return 0;
+        }
+
+        if (pfd.revents & (POLLERR | POLLHUP | POLLNVAL)) {
+            if (pos > 0) {
+                buf[pos] = '\0';
+                return pos; /* partial line on hangup */
+            }
+            return -1;
+        }
+
+        {
+            ssize_t n = read(u->fd, &ch, 1);
+            if (n == 1) {
+                if (ch == '\n') {
+                    /* strip optional trailing '\r' */
+                    if (pos > 0 && buf[pos - 1] == '\r') pos--;
+                    buf[pos] = '\0';
+                    return pos;
+                }
+                buf[pos++] = ch;
+            } else if (n == 0) {
+                break; /* EOF */
+            } else {
+                if (errno == EAGAIN || errno == EWOULDBLOCK) continue;
+                if (errno == EINTR) continue;
+                return -1; /* real error */
+            }
         }
     }
 
     if (pos > 0) {
         buf[pos] = '\0';
-        return pos; /* return partial line on timeout */
+        return pos; /* partial line */
     }
     return 0;
 }

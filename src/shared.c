@@ -1,3 +1,4 @@
+#include <signal.h>
 #include <stdio.h>
 #include "shared.h"
 
@@ -5,7 +6,7 @@
 
 static pthread_mutex_t g_mutex = PTHREAD_MUTEX_INITIALIZER;
 
-static volatile int g_running = 1;
+static volatile sig_atomic_t g_running = 1;
 
 static system_info_t  g_sysinfo;
 static sensor_sample_t g_sensor;

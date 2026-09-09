@@ -59,6 +59,14 @@ static int install_signal_handlers(void)
     if (sigaction(SIGINT, &sa, NULL) != 0) return -1;
     if (sigaction(SIGTERM, &sa, NULL) != 0) return -1;
     if (sigaction(SIGHUP, &sa, NULL) != 0) return -1;
+
+    /* Writes to already-closed client sockets must return EPIPE, not kill
+     * the whole gateway. */
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = SIG_IGN;
+    sigemptyset(&sa.sa_mask);
+    if (sigaction(SIGPIPE, &sa, NULL) != 0) return -1;
+
     return 0;
 }
 
@@ -383,6 +391,7 @@ int main(int argc, char **argv)
     int daemon_mode = 0;
     int scan_i2c = 0;
     int show_status = 0;
+    int simulate_override = 0;
     int port_override = -1;
 
     static const struct option long_opts[] = {
@@ -404,7 +413,7 @@ int main(int argc, char **argv)
         switch (opt) {
         case 'c': config_path = optarg; break;
         case 'p': port_override = atoi(optarg); break;
-        case 's': g_config.simulate = 1; break;
+        case 's': simulate_override = 1; break;
         case 'd': daemon_mode = 1; break;
         case 'i': scan_i2c = 1; break;
         case 'l': led_state = optarg; break;
@@ -428,6 +437,10 @@ int main(int argc, char **argv)
         }
     }
 
+    /* CLI explicit --simulate/--port must override values from the file. */
+    if (simulate_override) {
+        g_config.simulate = 1;
+    }
     if (port_override > 0) {
         g_config.http_port = port_override;
     }

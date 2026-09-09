@@ -34,6 +34,7 @@ static int g_led_active_low = 0;
 static int g_btn_active_low = 0;
 static int g_led_line      = -1;
 static int g_button_line   = -1;
+static int g_button_ready  = 0;
 
 /* fake state for simulation */
 static int g_sim_led = 0;
@@ -123,29 +124,30 @@ static int sysfs_read_int(int gpio, const char *attr)
 
 static int sysfs_led_init(int led_line, int button_line)
 {
-    if (led_line < 0) return -1;
+    int led_ok = 0;
+    int btn_ok = 0;
 
-    if (sysfs_gpio_export(led_line) != 0) {
-        LOG_ERROR("sysfs gpio export failed for LED line %d", led_line);
-        return -1;
-    }
-    if (sysfs_write_str(led_line, "direction", "out") != 0) {
-        LOG_ERROR("sysfs set direction failed for LED line %d", led_line);
-        return -1;
-    }
-    if (sysfs_write_int(led_line, "value", g_led_active_low ? 1 : 0) != 0) {
-        LOG_ERROR("sysfs set initial value failed for LED line %d", led_line);
-        return -1;
+    if (led_line >= 0) {
+        if (sysfs_gpio_export(led_line) == 0 &&
+            sysfs_write_str(led_line, "direction", "out") == 0 &&
+            sysfs_write_int(led_line, "value", g_led_active_low ? 1 : 0) == 0) {
+            led_ok = 1;
+        } else {
+            LOG_ERROR("sysfs LED init failed for line %d", led_line);
+        }
     }
 
     if (button_line >= 0) {
-        if (sysfs_gpio_export(button_line) != 0) {
-            LOG_WARN("sysfs gpio export failed for button line %d", button_line);
-        } else if (sysfs_write_str(button_line, "direction", "in") != 0) {
-            LOG_WARN("sysfs set direction failed for button line %d", button_line);
+        if (sysfs_gpio_export(button_line) == 0 &&
+            sysfs_write_str(button_line, "direction", "in") == 0) {
+            btn_ok = 1;
+        } else {
+            LOG_WARN("sysfs button init failed for line %d", button_line);
         }
     }
-    return 0;
+
+    g_button_ready = btn_ok;
+    return (led_ok || btn_ok) ? 0 : -1;
 }
 
 /* ------------------------------------------------------------------ */
@@ -223,7 +225,11 @@ static int gpio_chardev_v2_init(const app_config_t *cfg)
 
     close(fd);
 
-    if (!led_ok) {
+    if (!led_ok && !btn_ok) {
+        if (g_led_fd >= 0) {
+            close(g_led_fd);
+            g_led_fd = -1;
+        }
         if (g_btn_fd >= 0) {
             close(g_btn_fd);
             g_btn_fd = -1;
@@ -231,8 +237,12 @@ static int gpio_chardev_v2_init(const app_config_t *cfg)
         return -1;
     }
 
-    LOG_INFO("GPIO char-dev v2 backend ready: chip=%s led_line=%d%s",
-             chip_path, cfg->led_line, btn_ok ? " button_line=ok" : "");
+    g_button_ready = btn_ok;
+
+    LOG_INFO("GPIO char-dev v2 backend ready: chip=%s led=%s button=%s",
+             chip_path,
+             led_ok ? "ok" : "unavailable",
+             btn_ok ? "ok" : "unavailable");
     return 0;
 }
 
@@ -312,7 +322,11 @@ static int gpio_chardev_init(const app_config_t *cfg)
 
     close(fd);
 
-    if (!led_ok) {
+    if (!led_ok && !btn_ok) {
+        if (g_led_fd >= 0) {
+            close(g_led_fd);
+            g_led_fd = -1;
+        }
         if (g_btn_fd >= 0) {
             close(g_btn_fd);
             g_btn_fd = -1;
@@ -320,8 +334,12 @@ static int gpio_chardev_init(const app_config_t *cfg)
         return -1;
     }
 
-    LOG_INFO("GPIO char-dev backend ready: chip=%s led_line=%d%s",
-             chip_path, cfg->led_line, btn_ok ? " button_line=ok" : "");
+    g_button_ready = btn_ok;
+
+    LOG_INFO("GPIO char-dev backend ready: chip=%s led=%s button=%s",
+             chip_path,
+             led_ok ? "ok" : "unavailable",
+             btn_ok ? "ok" : "unavailable");
     return 0;
 }
 
@@ -375,6 +393,7 @@ int gpio_dev_init(const app_config_t *cfg, gpio_button_cb_t button_cb, void *use
     }
 
     g_backend = GPIO_BACKEND_NONE;
+    g_button_ready = 0;
 
     if (gpio_chardev_init(cfg) == 0) {
         g_backend = GPIO_BACKEND_CHARDEV;
@@ -390,7 +409,7 @@ int gpio_dev_init(const app_config_t *cfg, gpio_button_cb_t button_cb, void *use
         return -1;
     }
 
-    if (cfg->button_line >= 0 && g_button_cb) {
+    if (cfg->button_line >= 0 && g_button_ready && g_button_cb) {
         int rc = pthread_create(&g_btn_thread, NULL, button_monitor_thread, NULL);
         if (rc == 0) {
             g_btn_thread_started = 1;
@@ -410,6 +429,7 @@ int gpio_dev_set_led(int value)
         g_sim_led = logical;
         return 0;
     case GPIO_BACKEND_CHARDEV:
+        if (g_led_fd < 0) return -1;
         if (g_use_v2) {
             struct gpio_v2_line_values vals;
 
@@ -434,7 +454,9 @@ int gpio_dev_set_led(int value)
     case GPIO_BACKEND_SYSFS: {
         /* physical value inversion is handled by hardware config only in
          * chardev; on sysfs we invert manually before writing. */
-        int val = g_led_active_low ? (logical ? 0 : 1) : logical;
+        int val;
+        if (g_led_line < 0) return -1;
+        val = g_led_active_low ? (logical ? 0 : 1) : logical;
         return sysfs_write_int(g_led_line, "value", val);
     }
     default:
@@ -449,6 +471,7 @@ int gpio_dev_get_led(void)
     case GPIO_BACKEND_SIM:
         return g_sim_led;
     case GPIO_BACKEND_CHARDEV:
+        if (g_led_fd < 0) return -1;
         if (g_use_v2) {
             struct gpio_v2_line_values vals;
 
@@ -469,7 +492,9 @@ int gpio_dev_get_led(void)
             return data.values[0] ? 1 : 0;
         }
     case GPIO_BACKEND_SYSFS: {
-        int val = sysfs_read_int(g_led_line, "value");
+        int val;
+        if (g_led_line < 0) return -1;
+        val = sysfs_read_int(g_led_line, "value");
         if (val < 0) return -1;
         if (g_led_active_low) val = val ? 0 : 1;
         return val ? 1 : 0;
@@ -489,6 +514,7 @@ int gpio_dev_read_button(int *pressed)
         *pressed = g_sim_button;
         return 0;
     case GPIO_BACKEND_CHARDEV:
+        if (g_btn_fd < 0) return -1;
         if (g_use_v2) {
             struct gpio_v2_line_values vals;
 
@@ -511,7 +537,9 @@ int gpio_dev_read_button(int *pressed)
             return 0;
         }
     case GPIO_BACKEND_SYSFS: {
-        int val = sysfs_read_int(g_button_line, "value");
+        int val;
+        if (g_button_line < 0) return -1;
+        val = sysfs_read_int(g_button_line, "value");
         if (val < 0) return -1;
         val = val ? 1 : 0;
         *pressed = g_btn_active_low ? (val ? 0 : 1) : val;

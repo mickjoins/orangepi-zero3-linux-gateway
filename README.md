@@ -143,7 +143,7 @@ journalctl -u opiz3-gateway -f
 | `uart_baud` | `115200` | 串口波特率 |
 | `collect_interval_s` | `2` | 系统/传感器采集周期（秒） |
 | `simulate` | `0` | 是否启用仿真模式 |
-| `log_file` | `/var/log/opiz3-gateway.log` | 日志文件；留空时前台用 stderr，后台用 syslog |
+| `log_file` | 空 | 日志文件；留空时前台用 stderr，后台用 syslog。示例配置文件中为 `/var/log/opiz3-gateway.log` |
 
 ---
 
