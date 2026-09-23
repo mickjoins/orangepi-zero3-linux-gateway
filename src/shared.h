@@ -35,6 +35,7 @@ void shared_set_led(int value);       /* 0 or 1 */
 int  shared_get_led(void);
 
 /* button */
+void shared_button_set_initial(int pressed); /* state only; no press count */
 void shared_button_set(int pressed);  /* called by button monitor */
 int  shared_button_pressed_count(void);
 int  shared_button_current(void);

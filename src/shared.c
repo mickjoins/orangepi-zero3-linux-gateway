@@ -92,6 +92,13 @@ int shared_get_led(void)
     return v;
 }
 
+void shared_button_set_initial(int pressed)
+{
+    pthread_mutex_lock(&g_mutex);
+    g_button_current = pressed ? 1 : 0;
+    pthread_mutex_unlock(&g_mutex);
+}
+
 void shared_button_set(int pressed)
 {
     pthread_mutex_lock(&g_mutex);

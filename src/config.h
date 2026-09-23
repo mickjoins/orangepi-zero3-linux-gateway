@@ -7,6 +7,7 @@ typedef struct {
     /* http server */
     int  http_port;
     char http_bind_ip[64];
+    char http_access_token[128];
 
     /* gpio */
     int  gpio_chip;

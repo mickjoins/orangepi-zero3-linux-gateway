@@ -31,11 +31,59 @@ echo "==> Installing binary"
 install -m 0755 "$BUILD_BIN" "$APP_PATH"
 
 echo "==> Installing config (preserving existing)"
+install -d -m 0755 /etc/orangepi
 if [ -f "$CONF_PATH" ]; then
-    echo "    existing config kept at $CONF_PATH"
-    install -m 0644 config/opiz3-gateway.conf "$CONF_PATH.new"
+    echo "    existing settings kept at $CONF_PATH"
+    chmod 0600 "$CONF_PATH"
+    install -m 0600 config/opiz3-gateway.conf "$CONF_PATH.new"
+
+    # Match the gateway's key=value parser: sections are ignored and the last
+    # value for a key wins. Only emit a migration decision, never the token.
+    migration_state=$(awk '
+        BEGIN { bind_ip = "127.0.0.1"; has_token = 0 }
+        {
+            line = $0
+            sub(/^[[:space:]]+/, "", line)
+            if (line == "" || substr(line, 1, 1) == "#" ||
+                substr(line, 1, 1) == ";" || substr(line, 1, 1) == "[") next
+            pos = index(line, "=")
+            if (!pos) next
+            key = substr(line, 1, pos - 1)
+            value = substr(line, pos + 1)
+            sub(/[[:space:]]+$/, "", key)
+            sub(/[;#].*$/, "", value)
+            sub(/^[[:space:]]+/, "", value)
+            sub(/[[:space:]]+$/, "", value)
+            if (key == "http_bind_ip") bind_ip = value
+            if (key == "http_access_token") has_token = (value != "")
+        }
+        END {
+            if (bind_ip != "127.0.0.1" && !has_token) print "migrate"
+            else print "ok"
+        }
+    ' "$CONF_PATH")
+
+    if [ "$migration_state" = migrate ]; then
+        echo "    external bind has no access token; migrating $CONF_PATH"
+        # A token must never appear in shell xtrace or installer output.
+        set +x
+        token=$(od -An -N 24 -tx1 /dev/urandom | tr -d '[:space:]')
+        if [ "$(printf %s "$token" | wc -c)" -ne 48 ]; then
+            echo "cannot generate a 24-byte access token" >&2
+            exit 1
+        fi
+        case "$token" in
+            *[!0-9a-f]*)
+                echo "cannot generate a hexadecimal access token" >&2
+                exit 1
+                ;;
+        esac
+        printf '\nhttp_access_token = %s\n' "$token" >> "$CONF_PATH"
+        unset token
+        echo "    access token written to $CONF_PATH (mode 0600); inspect the file to retrieve it"
+    fi
 else
-    install -m 0644 config/opiz3-gateway.conf "$CONF_PATH"
+    install -m 0600 config/opiz3-gateway.conf "$CONF_PATH"
 fi
 
 echo "==> Installing systemd service"

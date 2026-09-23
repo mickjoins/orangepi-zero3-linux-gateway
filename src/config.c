@@ -1,6 +1,8 @@
 #include "config.h"
 
 #include <ctype.h>
+#include <errno.h>
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -14,12 +16,12 @@ void config_set_defaults(app_config_t *cfg)
     memset(cfg, 0, sizeof(*cfg));
 
     cfg->http_port = 8080;
-    snprintf(cfg->http_bind_ip, sizeof(cfg->http_bind_ip), "%s", "0.0.0.0");
+    snprintf(cfg->http_bind_ip, sizeof(cfg->http_bind_ip), "%s", "127.0.0.1");
 
     cfg->gpio_chip = 0;
     cfg->led_line = 69;       /* Allwinner H618 PC5 on many Orange Pi Zero 3 images */
     cfg->button_line = 70;    /* Optional; change to 74/75 etc. see README */
-    cfg->led_active_low = 0;
+    cfg->led_active_low = 1;
     cfg->button_active_low = 1;   /* most buttons connect GPIO to GND */
 
     snprintf(cfg->i2c_bus, sizeof(cfg->i2c_bus), "%s", "/dev/i2c-1");
@@ -57,13 +59,50 @@ static char *strip_inline_comment(char *s)
     return s;
 }
 
+static int parse_decimal_range(const char *value, long min, long max, int *out)
+{
+    char *end;
+    long parsed;
+
+    errno = 0;
+    parsed = strtol(value, &end, 10);
+    if (errno == ERANGE || end == value || *end != '\0' ||
+        parsed < min || parsed > max) {
+        return -1;
+    }
+    *out = (int)parsed;
+    return 0;
+}
+
+static int supported_uart_baud(int baud)
+{
+    switch (baud) {
+    case 9600:
+    case 19200:
+    case 38400:
+    case 57600:
+    case 115200:
+    case 230400:
+    case 460800:
+    case 921600:
+        return 1;
+    default:
+        return 0;
+    }
+}
+
 static int parse_key_value(app_config_t *cfg, const char *key, const char *value)
 {
     if (strcmp(key, "http_port") == 0) {
-        cfg->http_port = atoi(value);
-        if (cfg->http_port <= 0 || cfg->http_port > 65535) cfg->http_port = 8080;
+        if (parse_decimal_range(value, 1, 65535, &cfg->http_port) != 0) {
+            LOG_WARN("invalid http_port '%s', using 8080", value);
+            cfg->http_port = 8080;
+        }
     } else if (strcmp(key, "http_bind_ip") == 0) {
         snprintf(cfg->http_bind_ip, sizeof(cfg->http_bind_ip), "%s", value);
+    } else if (strcmp(key, "http_access_token") == 0) {
+        if (strlen(value) >= sizeof(cfg->http_access_token)) return -2;
+        snprintf(cfg->http_access_token, sizeof(cfg->http_access_token), "%s", value);
     } else if (strcmp(key, "gpio_chip") == 0) {
         cfg->gpio_chip = atoi(value);
     } else if (strcmp(key, "led_line") == 0) {
@@ -81,11 +120,17 @@ static int parse_key_value(app_config_t *cfg, const char *key, const char *value
     } else if (strcmp(key, "uart_dev") == 0) {
         snprintf(cfg->uart_dev, sizeof(cfg->uart_dev), "%s", value);
     } else if (strcmp(key, "uart_baud") == 0) {
-        cfg->uart_baud = atoi(value);
-        if (cfg->uart_baud <= 0) cfg->uart_baud = 115200;
+        if (parse_decimal_range(value, 1, INT_MAX, &cfg->uart_baud) != 0 ||
+            !supported_uart_baud(cfg->uart_baud)) {
+            LOG_WARN("unsupported uart_baud '%s', using 115200", value);
+            cfg->uart_baud = 115200;
+        }
     } else if (strcmp(key, "collect_interval_s") == 0) {
-        cfg->collect_interval_s = atoi(value);
-        if (cfg->collect_interval_s < 1) cfg->collect_interval_s = 2;
+        if (parse_decimal_range(value, 1, INT_MAX / 10,
+                                &cfg->collect_interval_s) != 0) {
+            LOG_WARN("invalid collect_interval_s '%s', using 2", value);
+            cfg->collect_interval_s = 2;
+        }
     } else if (strcmp(key, "simulate") == 0) {
         cfg->simulate = atoi(value) ? 1 : 0;
     } else if (strcmp(key, "log_file") == 0) {
@@ -136,8 +181,13 @@ int config_load(app_config_t *cfg, const char *path)
 
         key = trim(key);
 
-        if (parse_key_value(cfg, key, value) != 0) {
+        int result = parse_key_value(cfg, key, value);
+        if (result == -1) {
             LOG_WARN("unknown config key line %d: %s", lineno, key);
+        } else if (result == -2) {
+            LOG_ERROR("invalid config value at line %d for %s", lineno, key);
+            fclose(fp);
+            return -1;
         }
     }
 

@@ -3,11 +3,15 @@
 #include <arpa/inet.h>
 #include <errno.h>
 #include <netinet/in.h>
+#include <poll.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <sys/socket.h>
+#include <sys/time.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "config.h"
@@ -17,11 +21,18 @@
 #include "version.h"
 
 #define HTTP_MAX_HEADER 2048
-#define HTTP_MAX_BODY   512
+#define HTTP_MAX_TOKEN  256
+#define HTTP_JSON_SIZE  4096
+#define HTTP_TIMEOUT_MS 3000
+#define HTTP_POLL_MS    200
 
 static pthread_t g_thread;
 static int g_thread_started = 0;
 static int g_listen_fd = -1;
+static int g_client_fd = -1;
+static pthread_mutex_t g_socket_mutex = PTHREAD_MUTEX_INITIALIZER;
+static char g_access_token[HTTP_MAX_TOKEN];
+static int g_http_port;
 
 /* ------------------------------------------------------------------ */
 /* HTML page                                                           */
@@ -69,8 +80,24 @@ static const char *INDEX_HTML =
 "  <button class=\"tog\" onclick=\"ledCtl('toggle')\">TOGGLE</button>"
 "</div>"
 "<script>"
-"function ledCtl(s){fetch('/api/gpio?state='+s,{method:'POST'}).then(r=>r.json()).then(j=>update(j));}"
-"async function refresh(){try{let r=await fetch('/api/status');let j=await r.json();update(j);}catch(e){}}"
+"let apiToken=sessionStorage.getItem('opiz3-token')||'';"
+"let authDismissed=false;"
+"async function apiFetch(path,opts={}){"
+" let headers={...(opts.headers||{}),'X-Requested-With':'XMLHttpRequest'};"
+" if(apiToken)headers.Authorization='Bearer '+apiToken;"
+" let r=await fetch(path,{...opts,headers});"
+" if(r.status===401&&!authDismissed){"
+"  let entered=prompt('请输入 API 访问令牌');"
+"  if(entered===null){authDismissed=true;return r;}"
+"  apiToken=entered.trim();sessionStorage.setItem('opiz3-token',apiToken);"
+"  headers.Authorization='Bearer '+apiToken;"
+"  r=await fetch(path,{...opts,headers});"
+"  if(r.status===401){sessionStorage.removeItem('opiz3-token');apiToken='';authDismissed=true;alert('访问令牌无效，请重试。');}"
+" }"
+" return r;"
+"}"
+"async function ledCtl(s){try{authDismissed=false;let r=await apiFetch('/api/gpio?state='+s,{method:'POST'});if(r.ok)update(await r.json());}catch(e){}}"
+"async function refresh(){try{let r=await apiFetch('/api/status');if(r.ok)update(await r.json());}catch(e){}}"
 "function update(j){"
 " document.getElementById('host').textContent=j.hostname||'-';"
 " document.getElementById('uptime').textContent=j.uptime_s?j.uptime_s+' s':'-';"
@@ -98,7 +125,13 @@ static const char *http_code_text(int code)
 {
     switch (code) {
     case 200: return "OK";
+    case 400: return "Bad Request";
+    case 401: return "Unauthorized";
+    case 403: return "Forbidden";
     case 404: return "Not Found";
+    case 405: return "Method Not Allowed";
+    case 408: return "Request Timeout";
+    case 431: return "Request Header Fields Too Large";
     case 500: return "Internal Server Error";
     default:  return "OK";
     }
@@ -120,25 +153,44 @@ static int http_write_all(int fd, const char *buf, size_t len)
     return 0;
 }
 
-static void http_send(int fd, int code, const char *content_type, const char *body)
+static void http_send_extra(int fd, int code, const char *content_type,
+                            const char *body, const char *extra_headers)
 {
     char header[512];
     size_t body_len = strlen(body ? body : "");
+    int n;
 
-    snprintf(header, sizeof(header),
+    n = snprintf(header, sizeof(header),
              "HTTP/1.1 %d %s\r\n"
              "Server: opiz3-gateway/%s\r\n"
              "Content-Type: %s; charset=utf-8\r\n"
              "Content-Length: %zu\r\n"
              "Connection: close\r\n"
              "Cache-Control: no-cache\r\n"
+             "%s"
              "\r\n",
-             code, http_code_text(code), APP_VERSION, content_type, body_len);
+             code, http_code_text(code), APP_VERSION, content_type, body_len,
+             extra_headers ? extra_headers : "");
+    if (n < 0 || (size_t)n >= sizeof(header)) return;
 
     if (http_write_all(fd, header, strlen(header)) != 0) return;
     if (body && body_len > 0) {
         (void)http_write_all(fd, body, body_len);
     }
+}
+
+static void http_send(int fd, int code, const char *content_type, const char *body)
+{
+    http_send_extra(fd, code, content_type, body, NULL);
+}
+
+static void http_send_json_error(int fd, int code, const char *message,
+                                 const char *extra_headers)
+{
+    char body[128];
+    int n = snprintf(body, sizeof(body), "{\"error\":\"%s\"}", message);
+    if (n < 0 || (size_t)n >= sizeof(body)) return;
+    http_send_extra(fd, code, "application/json", body, extra_headers);
 }
 
 static int http_get_query_param(const char *path, const char *name, char *out, size_t out_sz)
@@ -181,48 +233,74 @@ static int http_path_matches(const char *path, const char *route)
 static int json_escape(const char *src, char *dst, size_t dst_sz)
 {
     size_t i = 0;
+    static const char hex[] = "0123456789abcdef";
 
-    while (*src && i + 2 < dst_sz) {
-        if (*src == '\\' || *src == '"') {
-            if (i + 3 >= dst_sz) break;
-            dst[i++] = '\\';
+    if (!src || !dst || dst_sz == 0) return -1;
+    while (*src) {
+        unsigned char ch = (unsigned char)*src++;
+        size_t needed = ch < 0x20 ? 6 : (ch == '\\' || ch == '"' ? 2 : 1);
+
+        if (needed >= dst_sz - i) {
+            dst[i] = '\0';
+            return -1;
         }
-        dst[i++] = *src++;
+        if (ch < 0x20) {
+            dst[i++] = '\\';
+            dst[i++] = 'u';
+            dst[i++] = '0';
+            dst[i++] = '0';
+            dst[i++] = hex[ch >> 4];
+            dst[i++] = hex[ch & 0x0f];
+        } else {
+            if (ch == '\\' || ch == '"') dst[i++] = '\\';
+            dst[i++] = (char)ch;
+        }
     }
     dst[i] = '\0';
-    return (int)i;
+    return 0;
 }
 
-static void build_gpio_json(char *out, size_t out_sz)
+static int build_gpio_json(char *out, size_t out_sz)
 {
     int led = gpio_dev_get_led();
+    int n;
 
-    snprintf(out, out_sz,
+    n = snprintf(out, out_sz,
              "{\"led\":%d,\"button_current_pressed\":%d,\"button_pressed_count\":%d}",
              led, shared_button_current(), shared_button_pressed_count());
+    return n >= 0 && (size_t)n < out_sz ? 0 : -1;
 }
 
-static void build_status_json(char *out, size_t out_sz)
+static int build_status_json(char *out, size_t out_sz)
 {
     system_info_t si;
     sensor_sample_t sensor;
     char serial[512];
     char sensor_json[256];
+    char serial_escaped[6 * sizeof(serial) + 1];
+    char hostname_escaped[6 * sizeof(si.hostname) + 1];
     int  led = gpio_dev_get_led();
+    int n;
 
     shared_get_sysinfo(&si);
     shared_get_sensor(&sensor);
     shared_get_serial_line(serial, sizeof(serial));
 
+    if (json_escape(serial, serial_escaped, sizeof(serial_escaped)) != 0 ||
+        json_escape(si.hostname, hostname_escaped, sizeof(hostname_escaped)) != 0) {
+        return -1;
+    }
+
     if (sensor.valid) {
-        snprintf(sensor_json, sizeof(sensor_json),
+        n = snprintf(sensor_json, sizeof(sensor_json),
                  "{\"valid\":1,\"temperature_c\":%.2f,\"humidity_pct\":%.2f}",
                  sensor.temperature_c, sensor.humidity_pct);
     } else {
-        snprintf(sensor_json, sizeof(sensor_json), "{\"valid\":0}");
+        n = snprintf(sensor_json, sizeof(sensor_json), "{\"valid\":0}");
     }
+    if (n < 0 || (size_t)n >= sizeof(sensor_json)) return -1;
 
-    snprintf(out, out_sz,
+    n = snprintf(out, out_sz,
              "{"
              "\"app\":\"%s\","
              "\"version\":\"%s\","
@@ -239,92 +317,331 @@ static void build_status_json(char *out, size_t out_sz)
              "\"sensor\":%s,"
              "\"led\":%d,"
              "\"button_pressed_count\":%d,"
-             "\"serial_line\":\"",
-             APP_NAME, APP_VERSION, si.hostname, si.uptime_s,
+             "\"serial_line\":\"%s\"}",
+             APP_NAME, APP_VERSION, hostname_escaped, si.uptime_s,
              si.cpu_count, si.cpu_usage_pct,
              si.loadavg_1m, si.loadavg_5m, si.loadavg_15m,
              si.mem_total_kb, si.mem_avail_kb, si.mem_usage_pct,
              si.soc_temp_c, si.cpu_freq_khz, sensor_json,
-             led < 0 ? -1 : led, shared_button_pressed_count());
-
-    /* append escaped serial line and close JSON */
-    if (strlen(out) + strlen(serial) + 3 < out_sz) {
-        char esc[600];
-        json_escape(serial, esc, sizeof(esc));
-        strncat(out, esc, out_sz - strlen(out) - 3);
-    }
-    strncat(out, "\"}", out_sz - strlen(out) - 1);
+             led < 0 ? -1 : led, shared_button_pressed_count(), serial_escaped);
+    return n >= 0 && (size_t)n < out_sz ? 0 : -1;
 }
 
 /* ------------------------------------------------------------------ */
 /* request handling                                                    */
 /* ------------------------------------------------------------------ */
 
+typedef struct {
+    char method[16];
+    char path[512];
+    const char *authorization;
+    const char *host;
+    int host_count;
+    const char *requested_with;
+} http_request_t;
+
+static long long monotonic_ms(void)
+{
+    struct timespec ts;
+
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) return -1;
+    return (long long)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
+/* Read through the header terminator, with a total deadline and size limit. */
+static int http_read_head(int fd, char *buf, size_t buf_sz)
+{
+    size_t used = 0;
+    long long now = monotonic_ms();
+    long long deadline;
+
+    if (now < 0 || buf_sz < 5) return 400;
+    deadline = now + HTTP_TIMEOUT_MS;
+
+    for (;;) {
+        struct pollfd pfd;
+        int wait_ms;
+        int ready;
+        ssize_t n;
+        size_t i;
+
+        if (!shared_is_running()) return -1;
+        now = monotonic_ms();
+        if (now < 0) return 400;
+        if (now >= deadline) return 408;
+        wait_ms = (int)(deadline - now);
+        if (wait_ms > HTTP_POLL_MS) wait_ms = HTTP_POLL_MS;
+
+        pfd.fd = fd;
+        pfd.events = POLLIN;
+        pfd.revents = 0;
+        ready = poll(&pfd, 1, wait_ms);
+        if (ready < 0) {
+            if (errno == EINTR) continue;
+            return 400;
+        }
+        if (ready == 0) continue;
+        if (pfd.revents & POLLNVAL) return 400;
+
+        n = recv(fd, buf + used, buf_sz - used - 1, 0);
+        if (n < 0) {
+            if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) continue;
+            return 400;
+        }
+        if (n == 0) return 400;
+        for (i = 0; i < (size_t)n; i++) {
+            if (buf[used + i] == '\0') {
+                /* A body may contain NUL; only the request head is parsed. */
+                buf[used + i] = '\0';
+                if (strstr(buf, "\r\n\r\n")) return 0;
+                return 400;
+            }
+        }
+        used += (size_t)n;
+        buf[used] = '\0';
+        if (strstr(buf, "\r\n\r\n")) return 0;
+        if (used == buf_sz - 1) return 431;
+    }
+}
+
+static int http_parse_request(char *buf, http_request_t *req)
+{
+    char *line_end = strstr(buf, "\r\n");
+    char *head_end = strstr(buf, "\r\n\r\n");
+    char *space1;
+    char *space2;
+    char *line;
+    int authorization_seen = 0;
+
+    if (!line_end || !head_end || line_end > head_end) return -1;
+    *line_end = '\0';
+    space1 = strchr(buf, ' ');
+    if (!space1) return -1;
+    *space1++ = '\0';
+    space2 = strchr(space1, ' ');
+    if (!space2) return -1;
+    *space2++ = '\0';
+    if (!buf[0] || !space1[0] || strchr(space2, ' ') ||
+        (strcmp(space2, "HTTP/1.1") != 0 && strcmp(space2, "HTTP/1.0") != 0) ||
+        strlen(buf) >= sizeof(req->method) || strlen(space1) >= sizeof(req->path) ||
+        space1[0] != '/') {
+        return -1;
+    }
+    snprintf(req->method, sizeof(req->method), "%s", buf);
+    snprintf(req->path, sizeof(req->path), "%s", space1);
+    req->authorization = NULL;
+    req->host = NULL;
+    req->host_count = 0;
+    req->requested_with = NULL;
+
+    line = line_end + 2;
+    while (line < head_end) {
+        char *next = strstr(line, "\r\n");
+        char *colon;
+        char *value;
+        char *end;
+
+        if (!next || next > head_end) return -1;
+        *next = '\0';
+        colon = strchr(line, ':');
+        if (!colon || colon == line) return -1;
+        *colon = '\0';
+        value = colon + 1;
+        while (*value == ' ' || *value == '\t') value++;
+        end = value + strlen(value);
+        while (end > value && (end[-1] == ' ' || end[-1] == '\t')) *--end = '\0';
+        if (strcasecmp(line, "Authorization") == 0) {
+            if (authorization_seen++) return -1;
+            req->authorization = value;
+        } else if (strcasecmp(line, "Host") == 0) {
+            req->host = value;
+            req->host_count++;
+        } else if (strcasecmp(line, "X-Requested-With") == 0) {
+            req->requested_with = value;
+        }
+        line = next + 2;
+    }
+    return 0;
+}
+
+static int http_host_allowed(const char *host)
+{
+    const char *port_separator;
+    size_t name_len;
+    char expected_port[6];
+
+    if (!host || !host[0]) return 0;
+    port_separator = strchr(host, ':');
+    name_len = port_separator ? (size_t)(port_separator - host) : strlen(host);
+    if (name_len != 9 ||
+        (strncasecmp(host, "localhost", name_len) != 0 &&
+         strncmp(host, "127.0.0.1", name_len) != 0)) {
+        return 0;
+    }
+    if (!port_separator) return 1;
+    snprintf(expected_port, sizeof(expected_port), "%d", g_http_port);
+    return strcmp(port_separator + 1, expected_port) == 0;
+}
+
+/* Fixed work for every supported token length; request length is public. */
+static int http_token_matches(const char *authorization)
+{
+    const char *provided = "";
+    size_t provided_len;
+    size_t expected_len = strlen(g_access_token);
+    volatile unsigned int diff;
+    size_t i;
+
+    if (authorization && strncasecmp(authorization, "Bearer ", 7) == 0) {
+        provided = authorization + 7;
+    }
+    provided_len = strlen(provided);
+    diff = (unsigned int)(provided_len ^ expected_len);
+    for (i = 0; i < HTTP_MAX_TOKEN; i++) {
+        unsigned char actual = i < provided_len ? (unsigned char)provided[i] : 0;
+        diff |= (unsigned char)g_access_token[i] ^ actual;
+    }
+    return diff == 0;
+}
+
+static int http_require_method(int fd, const char *actual, const char *wanted)
+{
+    if (strcmp(actual, wanted) == 0) return 1;
+    if (strcmp(wanted, "POST") == 0) {
+        http_send_json_error(fd, 405, "method not allowed", "Allow: POST\r\n");
+    } else {
+        http_send_json_error(fd, 405, "method not allowed", "Allow: GET\r\n");
+    }
+    return 0;
+}
+
+static void http_drain_pending_input(int fd)
+{
+    char scratch[1024];
+    size_t drained = 0;
+
+    while (drained < 8192) {
+        ssize_t n = recv(fd, scratch, sizeof(scratch), MSG_DONTWAIT);
+        if (n <= 0) return;
+        drained += (size_t)n;
+    }
+}
+
 static void handle_client(int fd)
 {
-    char buf[HTTP_MAX_HEADER];
-    ssize_t n;
-    char method[8] = "";
-    char path[512] = "";
+    char buf[HTTP_MAX_HEADER + 1];
+    http_request_t req;
+    int read_result = http_read_head(fd, buf, sizeof(buf));
 
-    /* Read request head (up to blank line). */
-    n = read(fd, buf, sizeof(buf) - 1);
-    if (n <= 0) return;
-    buf[n] = '\0';
-
-    if (sscanf(buf, "%7s %511s", method, path) != 2) {
-        http_send(fd, 404, "text/plain", "{\"error\":\"bad request\"}");
+    if (read_result < 0) return;
+    if (read_result != 0) {
+        http_send_json_error(fd, read_result,
+                             read_result == 408 ? "request timeout" :
+                             read_result == 431 ? "request headers too large" : "bad request",
+                             NULL);
+        if (read_result == 431) http_drain_pending_input(fd);
+        return;
+    }
+    if (http_parse_request(buf, &req) != 0) {
+        http_send_json_error(fd, 400, "bad request", NULL);
         return;
     }
 
-    LOG_INFO("HTTP %s %s", method, path);
+    LOG_INFO("HTTP %s %s", req.method, req.path);
 
-    if (strcmp(method, "GET") == 0 && strcmp(path, "/") == 0) {
+    if (!g_access_token[0]) {
+        if (req.host_count != 1) {
+            http_send_json_error(fd, 400, "missing or duplicate host", NULL);
+            return;
+        }
+        if (!http_host_allowed(req.host)) {
+            http_send_json_error(fd, 403, "invalid host", NULL);
+            return;
+        }
+    }
+
+    if (g_access_token[0] &&
+        (strncmp(req.path, "/api/", 5) == 0 || strcmp(req.path, "/api") == 0) &&
+        !http_token_matches(req.authorization)) {
+        http_send_json_error(fd, 401, "unauthorized",
+                             "WWW-Authenticate: Bearer realm=\"opiz3-gateway\"\r\n");
+        return;
+    }
+
+    if (strcmp(req.path, "/") == 0) {
+        if (!http_require_method(fd, req.method, "GET")) return;
         http_send(fd, 200, "text/html", INDEX_HTML);
         return;
     }
 
-    if (http_path_matches(path, "/api/status")) {
-        char json[2048];
-        build_status_json(json, sizeof(json));
-        http_send(fd, 200, "application/json", json);
-        return;
-    }
-
-    if (http_path_matches(path, "/api/sensor")) {
-        sensor_sample_t s;
-        char json[256];
-        shared_get_sensor(&s);
-        if (s.valid) {
-            snprintf(json, sizeof(json),
-                     "{\"valid\":1,\"temperature_c\":%.2f,\"humidity_pct\":%.2f,\"timestamp\":%ld}",
-                     s.temperature_c, s.humidity_pct, (long)s.timestamp);
-        } else {
-            snprintf(json, sizeof(json), "{\"valid\":0}");
+    if (http_path_matches(req.path, "/api/status")) {
+        char json[HTTP_JSON_SIZE];
+        if (!http_require_method(fd, req.method, "GET")) return;
+        if (build_status_json(json, sizeof(json)) != 0) {
+            http_send_json_error(fd, 500, "json too large", NULL);
+            return;
         }
         http_send(fd, 200, "application/json", json);
         return;
     }
 
-    if (http_path_matches(path, "/api/serial")) {
-        char line[512];
-        char json[2000];
-        char esc[1600];
-        shared_get_serial_line(line, sizeof(line));
-        json_escape(line, esc, sizeof(esc));
-        snprintf(json, sizeof(json), "{\"line\":\"%s\"}", esc);
+    if (http_path_matches(req.path, "/api/sensor")) {
+        sensor_sample_t s;
+        char json[256];
+        int n;
+        if (!http_require_method(fd, req.method, "GET")) return;
+        shared_get_sensor(&s);
+        if (s.valid) {
+            n = snprintf(json, sizeof(json),
+                     "{\"valid\":1,\"temperature_c\":%.2f,\"humidity_pct\":%.2f,\"timestamp\":%ld}",
+                     s.temperature_c, s.humidity_pct, (long)s.timestamp);
+        } else {
+            n = snprintf(json, sizeof(json), "{\"valid\":0}");
+        }
+        if (n < 0 || (size_t)n >= sizeof(json)) {
+            http_send_json_error(fd, 500, "json too large", NULL);
+            return;
+        }
         http_send(fd, 200, "application/json", json);
         return;
     }
 
-    if (http_path_matches(path, "/api/gpio")) {
+    if (http_path_matches(req.path, "/api/serial")) {
+        char line[512];
+        char json[HTTP_JSON_SIZE];
+        char esc[6 * sizeof(line) + 1];
+        int n;
+        if (!http_require_method(fd, req.method, "GET")) return;
+        shared_get_serial_line(line, sizeof(line));
+        if (json_escape(line, esc, sizeof(esc)) != 0) {
+            http_send_json_error(fd, 500, "json too large", NULL);
+            return;
+        }
+        n = snprintf(json, sizeof(json), "{\"line\":\"%s\"}", esc);
+        if (n < 0 || (size_t)n >= sizeof(json)) {
+            http_send_json_error(fd, 500, "json too large", NULL);
+            return;
+        }
+        http_send(fd, 200, "application/json", json);
+        return;
+    }
+
+    if (http_path_matches(req.path, "/api/gpio")) {
         char state[32] = "";
         int  led = -1;
+        int has_state = http_get_query_param(req.path, "state", state, sizeof(state));
 
-        http_get_query_param(path, "state", state, sizeof(state));
+        if (!http_require_method(fd, req.method, has_state ? "POST" : "GET")) return;
 
-        if (state[0]) {
-            int current = gpio_dev_get_led();
+        if (has_state) {
+            int current;
+
+            if (!req.requested_with ||
+                strcmp(req.requested_with, "XMLHttpRequest") != 0) {
+                http_send_json_error(fd, 403, "X-Requested-With required", NULL);
+                return;
+            }
+            current = gpio_dev_get_led();
 
             if (strcmp(state, "toggle") == 0) {
                 led = (current > 0) ? 0 : 1;
@@ -333,24 +650,27 @@ static void handle_client(int fd)
             } else if (strcmp(state, "off") == 0 || strcmp(state, "0") == 0) {
                 led = 0;
             } else {
-                http_send(fd, 404, "application/json", "{\"error\":\"invalid state\"}");
+                http_send_json_error(fd, 400, "invalid state", NULL);
                 return;
             }
 
             if (gpio_dev_set_led(led) != 0) {
-                http_send(fd, 500, "application/json", "{\"error\":\"gpio write failed\"}");
+                http_send_json_error(fd, 500, "gpio write failed", NULL);
                 return;
             }
             shared_set_led(led);
         }
 
         char json[256];
-        build_gpio_json(json, sizeof(json));
+        if (build_gpio_json(json, sizeof(json)) != 0) {
+            http_send_json_error(fd, 500, "json too large", NULL);
+            return;
+        }
         http_send(fd, 200, "application/json", json);
         return;
     }
 
-    http_send(fd, 404, "application/json", "{\"error\":\"not found\"}");
+    http_send_json_error(fd, 404, "not found", NULL);
 }
 
 /* ------------------------------------------------------------------ */
@@ -370,6 +690,10 @@ static void *http_server_thread(void *arg)
 
     while (shared_is_running()) {
         int client = accept(fd, NULL, NULL);
+        struct timeval timeout = {
+            .tv_sec = HTTP_TIMEOUT_MS / 1000,
+            .tv_usec = (HTTP_TIMEOUT_MS % 1000) * 1000
+        };
         if (client < 0) {
             if (errno == EINTR) continue;
             if (shared_is_running()) {
@@ -377,21 +701,41 @@ static void *http_server_thread(void *arg)
             }
             break;
         }
+        if (setsockopt(client, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) != 0 ||
+            setsockopt(client, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout)) != 0) {
+            LOG_ERROR("cannot set HTTP client timeout: %s", strerror(errno));
+            close(client);
+            continue;
+        }
+        pthread_mutex_lock(&g_socket_mutex);
+        if (!shared_is_running()) {
+            pthread_mutex_unlock(&g_socket_mutex);
+            close(client);
+            break;
+        }
+        g_client_fd = client;
+        pthread_mutex_unlock(&g_socket_mutex);
         handle_client(client);
+        pthread_mutex_lock(&g_socket_mutex);
+        g_client_fd = -1;
         close(client);
+        pthread_mutex_unlock(&g_socket_mutex);
     }
 
+    pthread_mutex_lock(&g_socket_mutex);
     close(fd);
     if (g_listen_fd == fd) g_listen_fd = -1;
+    pthread_mutex_unlock(&g_socket_mutex);
     LOG_INFO("HTTP server thread exited");
     return NULL;
 }
 
-int http_server_start(int port, const char *bind_ip)
+int http_server_start(int port, const char *bind_ip, const char *access_token)
 {
     int fd;
     int reuse = 1;
     struct sockaddr_in addr;
+    size_t token_len = access_token ? strlen(access_token) : 0;
 
     if (g_thread_started) return 0;
 
@@ -399,6 +743,18 @@ int http_server_start(int port, const char *bind_ip)
         LOG_ERROR("invalid HTTP port: %d", port);
         return -1;
     }
+
+    if (token_len >= sizeof(g_access_token)) {
+        LOG_ERROR("HTTP access token is too long");
+        return -1;
+    }
+    if ((!bind_ip || strcmp(bind_ip, "127.0.0.1") != 0) && token_len == 0) {
+        LOG_ERROR("HTTP access token is required outside 127.0.0.1");
+        return -1;
+    }
+    memset(g_access_token, 0, sizeof(g_access_token));
+    if (token_len > 0) memcpy(g_access_token, access_token, token_len);
+    g_http_port = port;
 
     fd = socket(AF_INET, SOCK_STREAM, 0);
     if (fd < 0) {
@@ -452,14 +808,14 @@ int http_server_start(int port, const char *bind_ip)
 
 void http_server_stop(void)
 {
-    int fd = g_listen_fd;
-
-    if (fd >= 0) {
-        (void)shutdown(fd, SHUT_RDWR);
-    }
+    pthread_mutex_lock(&g_socket_mutex);
+    if (g_listen_fd >= 0) (void)shutdown(g_listen_fd, SHUT_RDWR);
+    if (g_client_fd >= 0) (void)shutdown(g_client_fd, SHUT_RDWR);
+    pthread_mutex_unlock(&g_socket_mutex);
 
     if (g_thread_started) {
         pthread_join(g_thread, NULL);
         g_thread_started = 0;
     }
+    memset(g_access_token, 0, sizeof(g_access_token));
 }

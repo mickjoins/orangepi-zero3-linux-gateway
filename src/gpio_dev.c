@@ -141,6 +141,9 @@ static int sysfs_led_init(int led_line, int button_line)
         if (sysfs_gpio_export(button_line) == 0 &&
             sysfs_write_str(button_line, "direction", "in") == 0) {
             btn_ok = 1;
+            if (g_btn_active_low) {
+                LOG_WARN("sysfs GPIO cannot request a button pull-up; use an external pull-up or configure pin bias in the device tree");
+            }
         } else {
             LOG_WARN("sysfs button init failed for line %d", button_line);
         }
@@ -349,7 +352,9 @@ static int gpio_chardev_init(const app_config_t *cfg)
 
 static void *button_monitor_thread(void *arg)
 {
-    int last = -1;
+    int stable = -1;
+    int candidate = -1;
+    int candidate_reads = 0;
     (void)arg;
 
     LOG_INFO("button monitor thread started");
@@ -358,12 +363,28 @@ static void *button_monitor_thread(void *arg)
         int pressed = 0;
 
         if (gpio_dev_read_button(&pressed) == 0) {
-            if (pressed != last) {
-                last = pressed;
+            if (stable < 0) {
+                /* The first reading is a baseline, not a new press edge. */
+                stable = pressed;
+                candidate = pressed;
+                if (g_button_cb) g_button_cb(pressed, 1, g_button_user);
+            } else if (pressed == stable) {
+                candidate = stable;
+                candidate_reads = 0;
+            } else if (pressed != candidate) {
+                candidate = pressed;
+                candidate_reads = 1;
+            } else if (++candidate_reads >= 2) {
+                /* Two matching 20 Hz reads require 50 ms of stability. */
+                stable = pressed;
+                candidate_reads = 0;
                 if (g_button_cb) {
-                    g_button_cb(pressed, g_button_user);
+                    g_button_cb(stable, 0, g_button_user);
                 }
             }
+        } else {
+            candidate = stable;
+            candidate_reads = 0;
         }
         usleep(50 * 1000); /* 20 Hz polling */
     }

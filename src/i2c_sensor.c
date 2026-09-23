@@ -46,6 +46,21 @@ static int i2c_open(const char *bus, int addr)
     return fd;
 }
 
+/* AHT20 CRC-8: initial value 0xff, polynomial x^8 + x^5 + x^4 + 1. */
+static unsigned char aht20_crc8(const unsigned char *data, size_t len)
+{
+    unsigned char crc = 0xff;
+
+    for (size_t i = 0; i < len; i++) {
+        crc ^= data[i];
+        for (int bit = 0; bit < 8; bit++) {
+            crc = (crc & 0x80) ? (unsigned char)((crc << 1) ^ 0x31)
+                               : (unsigned char)(crc << 1);
+        }
+    }
+    return crc;
+}
+
 int i2c_bus_scan(const char *bus, int *addr_list, int max_addrs)
 {
     int fd;
@@ -82,9 +97,10 @@ int i2c_bus_scan(const char *bus, int *addr_list, int max_addrs)
 
 int i2c_aht20_read(const char *bus, sensor_sample_t *out)
 {
-    unsigned char cmd_init[1]  = { 0xBE };
+    unsigned char cmd_init[3]  = { 0xBE, 0x08, 0x00 };
     unsigned char cmd_trig[3]  = { 0xAC, 0x33, 0x00 };
     unsigned char data[7];
+    unsigned char status;
     int  fd;
     int  retries;
 
@@ -94,13 +110,24 @@ int i2c_aht20_read(const char *bus, sensor_sample_t *out)
     fd = i2c_open(bus, 0x38);
     if (fd < 0) return -1;
 
-    /* AHT20 initialization (safe to send even if already calibrated). */
-    if (write(fd, cmd_init, sizeof(cmd_init)) != (ssize_t)sizeof(cmd_init)) {
-        LOG_WARN("AHT20 init write failed: %s", strerror(errno));
+    /* Datasheet 0x71 is the on-wire read address (0x38 << 1 | 1), which
+     * read() sends after I2C_SLAVE selects 0x38; it is not a command byte.
+     * Allow the sensor's power-on period before checking calibration. */
+    usleep(100 * 1000);
+    if (read(fd, &status, 1) != 1) {
+        LOG_WARN("AHT20 status read failed: %s", strerror(errno));
         close(fd);
         return -1;
     }
-    usleep(50 * 1000);
+
+    if ((status & 0x08) == 0) {
+        if (write(fd, cmd_init, sizeof(cmd_init)) != (ssize_t)sizeof(cmd_init)) {
+            LOG_WARN("AHT20 init write failed: %s", strerror(errno));
+            close(fd);
+            return -1;
+        }
+        usleep(10 * 1000);
+    }
 
     /* Trigger a measurement. */
     if (write(fd, cmd_trig, sizeof(cmd_trig)) != (ssize_t)sizeof(cmd_trig)) {
@@ -126,6 +153,10 @@ int i2c_aht20_read(const char *bus, sensor_sample_t *out)
     }
     if ((data[0] & 0x80) != 0) {
         LOG_WARN("AHT20 busy after read");
+        return -1;
+    }
+    if (aht20_crc8(data, 6) != data[6]) {
+        LOG_WARN("AHT20 data CRC mismatch");
         return -1;
     }
 

@@ -14,10 +14,10 @@
 | 环境传感器 | AHT20/AHT21 温湿度采集 | 使用 Linux `i2c-dev` 接口 + ioctl 实现，无外部库依赖 |
 | I2C 工具 | I2C 总线扫描 | `--scan-i2c` 命令可列出 0x03~0x77 上的设备 |
 | GPIO | LED 输出（可配置 active-low） | 优先使用 `/dev/gpiochipN` GPIO character device（v1，自动尝试 v2），失败时回退 `/sys/class/gpio` |
-| GPIO | 按键输入，默认带内部上拉，按下翻转 LED | 独立监控线程，20 Hz 轮询，边沿计数 |
-| 串口 | 读取外部设备按行上报的数据 | termios 配置，1 字节读 + 0.5s 超时；模拟模式下每 5 秒生成一条 JSON |
+| GPIO | 按键输入，按下翻转 LED | 独立监控线程，20 Hz 轮询并消抖；sysfs 回退时需外部或设备树上拉 |
+| 串口 | 读取外部设备按行上报的数据 | termios 配置，保留跨读取片段直到换行；模拟模式下每 5 秒生成一条 JSON |
 | Web 仪表盘 | 单页仪表盘，自动 2 秒刷新 | 内嵌 HTML/CSS/JS，无需外部网页文件 |
-| REST API | `/api/status` `/api/sensor` `/api/serial` `/api/gpio` | JSON 格式，支持 GET/POST 控制 LED |
+| REST API | `/api/status` `/api/sensor` `/api/serial` `/api/gpio` | JSON 格式，POST 控制 LED；远程访问需令牌 |
 | 守护进程 | `--daemon` 后台运行、写入 syslog/日志文件 | 支持 systemd 托管 |
 | 仿真模式 | `--simulate` 在 x86 Linux 主机上仿真全部功能 | 便于开发、演示与 CI 验证 |
 | 交叉编译 | `make CROSS_COMPILE=aarch64-linux-gnu-` | 已在本仓库用 aarch64-linux-gnu-gcc 验证 |
@@ -62,13 +62,15 @@ cd orangepi-zero3-linux-gateway
 make clean
 make
 make run-sim          # 前台仿真运行，端口 8080
+make test             # 主机端串口组帧测试
+make test-http        # 本机 HTTP 接口与退出集成测试
 ```
 
 浏览器打开 `http://127.0.0.1:8080` 可查看仪表盘；或者：
 
 ```bash
 curl http://127.0.0.1:8080/api/status
-curl -X POST 'http://127.0.0.1:8080/api/gpio?state=toggle'
+curl -X POST -H 'X-Requested-With: XMLHttpRequest' 'http://127.0.0.1:8080/api/gpio?state=toggle'
 ```
 
 ### 3.2 交叉编译（得到 aarch64 可执行文件）
@@ -97,6 +99,8 @@ ssh orangepi@<IP> 'sudo cp /tmp/opiz3-gateway /usr/bin && sudo mkdir -p /etc/ora
 make                     # 在板子上原生编译
 sudo sh deploy/install.sh
 ```
+
+安装脚本会保留已有配置。如果旧配置监听局域网地址但没有访问令牌，升级时会自动生成令牌并写入权限为 `0600` 的 `/etc/orangepi/opiz3-gateway.conf`；请在该文件中查看令牌，再用于网页或 API 请求。
 
 ### 3.4 运行
 
@@ -131,11 +135,12 @@ journalctl -u opiz3-gateway -f
 | 键 | 默认值 | 说明 |
 |---|---|---|
 | `http_port` | `8080` | HTTP 监听端口 |
-| `http_bind_ip` | `0.0.0.0` | 监听地址（当前实现绑定 `0.0.0.0`，该键预留） |
+| `http_bind_ip` | `127.0.0.1` | HTTP 监听地址；本机使用时无需令牌 |
+| `http_access_token` | 空 | 远程绑定地址时必填；API 请求使用 `Authorization: Bearer <token>`，配置文件权限应为 0600 |
 | `gpio_chip` | `0` | GPIO 字符设备编号，`/dev/gpiochip0` |
 | `led_line` | `69` | LED 引脚。Allwinner 全局编号常为 bank*32+偏移，如 PC5=69 |
 | `button_line` | `70` | 按键引脚。设为 `-1` 禁用 |
-| `led_active_low` | `0` | LED 是否低电平有效 |
+| `led_active_low` | `1` | LED 是否低电平有效；与下文 3.3V → LED → GPIO 接法一致 |
 | `button_active_low` | `1` | 按键是否低电平有效（按下时接地） |
 | `i2c_bus` | `/dev/i2c-1` | I2C 控制器设备节点 |
 | `i2c_sensor_type` | `aht20` | 传感器类型，当前支持 `aht20` |
@@ -151,6 +156,8 @@ journalctl -u opiz3-gateway -f
 
 开发时可浏览器直接打开 `/` 查看仪表盘。
 
+默认只监听 `127.0.0.1`。GPIO 写请求还需 `X-Requested-With: XMLHttpRequest` 请求头，以阻止其他网页直接发起跨站写入。需要从局域网访问时，在配置中设置开发板的局域网 IP（或 `0.0.0.0`）和随机生成的 `http_access_token`，然后重启服务。网页会提示输入令牌，并在当前浏览器标签页中保存；命令行请求可加入 `Authorization: Bearer <token>` 请求头。令牌会通过普通 HTTP 传输，跨不可信网络时请使用 HTTPS 反向代理。
+
 | 方法 | 路径 | 功能 | 成功响应示例 |
 |---|---|---|---|
 | GET | `/` | Web 仪表盘 | HTML |
@@ -158,9 +165,9 @@ journalctl -u opiz3-gateway -f
 | GET | `/api/sensor` | 最近一次温湿度 | `{"valid":1,"temperature_c":28.50,"humidity_pct":63.20}` |
 | GET | `/api/serial` | 最近一帧串口数据 | `{"line":"{...}"}` |
 | GET | `/api/gpio` | LED/按键状态 | `{"led":0,"button_current_pressed":0,"button_pressed_count":3}` |
-| POST/GET | `/api/gpio?state=on` | 打开 LED | 同上 |
-| POST/GET | `/api/gpio?state=off` | 关闭 LED | 同上 |
-| POST/GET | `/api/gpio?state=toggle` | 翻转 LED | 同上 |
+| POST | `/api/gpio?state=on` | 打开 LED | 同上 |
+| POST | `/api/gpio?state=off` | 关闭 LED | 同上 |
+| POST | `/api/gpio?state=toggle` | 翻转 LED | 同上 |
 
 `/api/status` 示例：
 
@@ -197,12 +204,12 @@ journalctl -u opiz3-gateway -f
 | 外设 | 板子信号 | 说明 |
 |---|---|---|
 | LED | GPIO PC5（全局编号 69，长脚串 330Ω 电阻） | 3.3V → 电阻 → LED → GPIO |
-| 按键 | GPIO PC6（全局编号 70，一端接 GND） | 依赖内部上拉，按下翻 LED |
+| 按键 | GPIO PC6（全局编号 70，一端接 GND） | 字符设备模式请求内部上拉；sysfs 模式需外部或设备树上拉 |
 | AHT20 | 3.3V、GND、I2C1 SDA、I2C1 SCL | 默认 `/dev/i2c-1`，地址 0x38 |
 | USB-TTL | UART TX/RX、GND | 默认 `/dev/ttyS1`，115200 8N1 |
 
 > GPIO 后端优先顺序为：字符设备 v1 → 字符设备 v2 → sysfs。若 `/dev/gpiochip0` 请求失败，
-> 程序会自动尝试下一级回退。active-low 极性由内核处理（chardev v1/v2）；sysfs 回退路径由程序手动取反。
+> 程序会自动尝试下一级回退。active-low 极性由内核处理（chardev v1/v2）；sysfs 回退路径由程序手动取反。sysfs 无法请求内部上拉，按键需外部或设备树上拉。
 
 ---
 
@@ -224,7 +231,7 @@ journalctl -u opiz3-gateway -f
   极端精简内核如同时关闭 v1/v2 与 sysfs GPIO，则需要 libgpiod 或内核配置调整。
 - 当前 HTTP 服务器为单线程 accept + 短连接，设计目标是轻量和零依赖，不是高并发
   静态文件服务器。生产环境若要处理高并发，建议用 lighttpd/nginx 反代，或扩展线程池。
-- `http_bind_ip` 键目前预留（服务器绑定 `0.0.0.0`）。
+- HTTP 服务按 `http_bind_ip` 绑定；非本机地址必须设置 `http_access_token`，API 才会启动。
 - 当前只内置 AHT20 驱动，项目结构预留了扩展其他 I2C 传感器在 `i2c_sensor.c` 中的位置。
 
 ---
@@ -238,7 +245,7 @@ journalctl -u opiz3-gateway -f
   2. serial：阻塞读取串口按行数据；
   3. button monitor：20 Hz 轮询 GPIO 按键边沿，短回调翻转 LED；
   4. http server：accept + 短连接处理。
-- 退出模型：SIGINT/SIGTERM → `shared_set_running(0)` → 各线程在 100 ms 级粒度退出 → 主线程 join。
+- 退出模型：SIGINT/SIGTERM → `shared_set_running(0)` → 各线程退出 → 主线程 join。SIGHUP 被忽略。
 
 ---
 

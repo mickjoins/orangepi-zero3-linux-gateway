@@ -37,6 +37,7 @@ static int g_uart_thread_started = 0;
 
 static void print_usage(FILE *fp, const char *argv0);
 static void daemonize(void);
+static int parse_port(const char *value, int *port);
 
 /* ------------------------------------------------------------------ */
 /* signal handling                                                     */
@@ -58,13 +59,14 @@ static int install_signal_handlers(void)
 
     if (sigaction(SIGINT, &sa, NULL) != 0) return -1;
     if (sigaction(SIGTERM, &sa, NULL) != 0) return -1;
-    if (sigaction(SIGHUP, &sa, NULL) != 0) return -1;
-
-    /* Writes to already-closed client sockets must return EPIPE, not kill
-     * the whole gateway. */
+    /* SIGHUP does not reload configuration. Ignore it rather than stopping
+     * successfully, which would leave a Restart=on-failure service stopped. */
     memset(&sa, 0, sizeof(sa));
     sa.sa_handler = SIG_IGN;
     sigemptyset(&sa.sa_mask);
+    if (sigaction(SIGHUP, &sa, NULL) != 0) return -1;
+
+    /* Writes to already-closed client sockets must not kill the gateway. */
     if (sigaction(SIGPIPE, &sa, NULL) != 0) return -1;
 
     return 0;
@@ -74,10 +76,14 @@ static int install_signal_handlers(void)
 /* button callback                                                     */
 /* ------------------------------------------------------------------ */
 
-static void on_button_event(int pressed, void *user)
+static void on_button_event(int pressed, int initial, void *user)
 {
     (void)user;
 
+    if (initial) {
+        shared_button_set_initial(pressed);
+        return;
+    }
     shared_button_set(pressed);
 
     if (pressed) {
@@ -309,6 +315,8 @@ static int action_status(void)
 
 static int run_server(int daemon_mode)
 {
+    int exit_code = 1;
+
     if (daemon_mode) {
         daemonize();
     }
@@ -319,7 +327,7 @@ static int run_server(int daemon_mode)
 
     if (install_signal_handlers() != 0) {
         LOG_ERROR("cannot install signal handlers: %s", strerror(errno));
-        return 1;
+        goto cleanup;
     }
 
     config_print(&g_config);
@@ -333,21 +341,22 @@ static int run_server(int daemon_mode)
     /* start collector */
     if (pthread_create(&g_collector_thread, NULL, collector_thread, NULL) != 0) {
         LOG_ERROR("cannot start collector thread");
-        return 1;
+        goto cleanup;
     }
     g_collector_thread_started = 1;
 
     /* start serial reader */
     if (pthread_create(&g_uart_thread, NULL, serial_thread, NULL) != 0) {
         LOG_ERROR("cannot start serial thread");
-        return 1;
+        goto cleanup;
     }
     g_uart_thread_started = 1;
 
     /* start HTTP server */
-    if (http_server_start(g_config.http_port, g_config.http_bind_ip) != 0) {
+    if (http_server_start(g_config.http_port, g_config.http_bind_ip,
+                          g_config.http_access_token) != 0) {
         LOG_ERROR("cannot start http server");
-        return 1;
+        goto cleanup;
     }
 
     LOG_INFO("%s v%s started (simulate=%d)", APP_NAME, APP_VERSION, g_config.simulate);
@@ -357,6 +366,9 @@ static int run_server(int daemon_mode)
         sleep(1);
     }
 
+    exit_code = 0;
+
+cleanup:
     LOG_INFO("shutting down...");
 
     shared_set_running(0);
@@ -375,7 +387,7 @@ static int run_server(int daemon_mode)
     gpio_dev_close();
     shared_destroy();
     LOG_INFO("bye");
-    return 0;
+    return exit_code;
 }
 
 /* ------------------------------------------------------------------ */
@@ -412,7 +424,12 @@ int main(int argc, char **argv)
     while ((opt = getopt_long(argc, argv, "c:p:sdl:itvh", long_opts, &opt_index)) != -1) {
         switch (opt) {
         case 'c': config_path = optarg; break;
-        case 'p': port_override = atoi(optarg); break;
+        case 'p':
+            if (parse_port(optarg, &port_override) != 0) {
+                fprintf(stderr, "invalid HTTP port '%s' (use 1-65535)\n", optarg);
+                return 1;
+            }
+            break;
         case 's': simulate_override = 1; break;
         case 'd': daemon_mode = 1; break;
         case 'i': scan_i2c = 1; break;
@@ -441,7 +458,7 @@ int main(int argc, char **argv)
     if (simulate_override) {
         g_config.simulate = 1;
     }
-    if (port_override > 0) {
+    if (port_override != -1) {
         g_config.http_port = port_override;
     }
 
@@ -462,6 +479,27 @@ int main(int argc, char **argv)
 /* ------------------------------------------------------------------ */
 /* usage / daemon                                                      */
 /* ------------------------------------------------------------------ */
+
+static int parse_port(const char *value, int *port)
+{
+    char *end;
+    const char *p;
+    long parsed;
+
+    if (!value || !*value) return -1;
+    for (p = value; *p; p++) {
+        if (*p < '0' || *p > '9') return -1;
+    }
+
+    errno = 0;
+    parsed = strtol(value, &end, 10);
+    if (errno == ERANGE || end == value || *end != '\0' ||
+        parsed < 1 || parsed > 65535) {
+        return -1;
+    }
+    *port = (int)parsed;
+    return 0;
+}
 
 static void print_usage(FILE *fp, const char *argv0)
 {
@@ -486,10 +524,12 @@ static void print_usage(FILE *fp, const char *argv0)
         "  GET  /api/status      full status JSON\n"
         "  GET  /api/sensor      latest sensor reading\n"
         "  GET  /api/serial      latest serial line\n"
-        "  GET/POST /api/gpio?state=on|off|toggle\n"
+        "  GET      /api/gpio (read state)\n"
+        "  POST     /api/gpio?state=on|off|toggle\n"
         "\n"
         "Default config values:\n"
-        "  http_port=8080  gpio_chip=0  led_line=69  button_line=70\n"
+        "  http_port=8080  http_bind_ip=127.0.0.1  gpio_chip=0\n"
+        "  led_line=69  led_active_low=1  button_line=70\n"
         "  i2c_bus=/dev/i2c-1  sensor=aht20  uart=/dev/ttyS1  baud=115200\n",
         argv0);
 }

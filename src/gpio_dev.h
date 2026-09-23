@@ -3,9 +3,9 @@
 
 #include "config.h"
 
-/* Called in button monitor thread context whenever the button is polled:
- * pressed == 1 edge, pressed == 0 edge. Keep the callback short. */
-typedef void (*gpio_button_cb_t)(int pressed, void *user);
+/* Called in button monitor thread context for the initial button state and
+ * later debounced edges. Initial state must not count as a press. */
+typedef void (*gpio_button_cb_t)(int pressed, int initial, void *user);
 
 /* Initialize LED output and optional button input.
  * In simulate mode this initializes an in-memory fake GPIO without hardware. */
